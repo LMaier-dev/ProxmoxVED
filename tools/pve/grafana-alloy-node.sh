@@ -10,6 +10,9 @@
 #   - ships systemd journal to Loki
 # Run on every node. The cluster OTLP metric-server config is created once
 # and replicates via /etc/pve/status.cfg.
+#
+# Re-running on a node with alloy installed prompts to Reinstall, Update, or
+# Uninstall. Headless: set ALLOY_ACTION=install|update|uninstall.
 
 header_info() {
   clear 2>/dev/null || true
@@ -62,7 +65,7 @@ require_pve() {
 }
 
 require_pve_9() {
-  local ver major minor
+  local ver major
   ver=$(pveversion | awk -F'/' '{print $2}' | awk -F'-' '{print $1}')
   IFS='.' read -r major _ _ <<<"$ver"
   if [ "${major:-0}" -lt 9 ]; then
@@ -81,6 +84,14 @@ otlp_already_configured() {
   echo "$out" | grep -q '"type"[[:space:]]*:[[:space:]]*"opentelemetry"' || return 1
   echo "$out" | grep -q '"server"[[:space:]]*:[[:space:]]*"127\.0\.0\.1"' || return 1
   return 0
+}
+
+alloy_installed() {
+  dpkg -s alloy >/dev/null 2>&1
+}
+
+otlp_server_named_exists() {
+  pvesh get /cluster/metrics/server/${OTLP_SERVER_NAME} --output-format json >/dev/null 2>&1
 }
 
 prompt_inputs() {
@@ -226,7 +237,7 @@ prometheus.relabel "pve_labels" {
 // ============================
 prometheus.exporter.unix "default" {
   include_exporter_metrics = true
-  enable_collectors = ["systemd", "processes"]
+  enable_collectors = ["systemd", "processes", "interrupts", "tcpstat"]
 
   cpu {
     info  = true
@@ -367,22 +378,110 @@ show_summary() {
   echo
 }
 
-main() {
-  header_info
-  require_root
-  require_pve
-  require_pve_9
+prompt_uninstall_options() {
+  # REMOVE_OTLP / REMOVE_REPO defaults: NO (both have cluster-wide / cross-tool blast radius).
+  # Headless: read from env, fall back to defaults.
+  if [ -n "${ALLOY_ACTION:-}" ] || [ -n "${ALLOY_PROMETHEUS_URL:-}" ] || [ -n "${ALLOY_LOKI_URL:-}" ]; then
+    case "${ALLOY_REMOVE_OTLP:-no}" in yes|YES|true|1) REMOVE_OTLP=1 ;; *) REMOVE_OTLP=0 ;; esac
+    case "${ALLOY_REMOVE_REPO:-no}" in yes|YES|true|1) REMOVE_REPO=1 ;; *) REMOVE_REPO=0 ;; esac
+    return
+  fi
 
-  if [ -z "${ALLOY_PROMETHEUS_URL:-}" ] && [ -z "${ALLOY_LOKI_URL:-}" ]; then
-    if ! whiptail --backtitle "Proxmox VE Helper Scripts" \
-        --title "Grafana Alloy on Proxmox VE" \
-        --yesno "Install Grafana Alloy on $(hostname) (PVE ${PVE_VER}).\n\nThis will:\n  - add the Grafana APT repository\n  - install/upgrade the alloy package\n  - write /etc/alloy/config.alloy\n  - enable and start alloy.service\n  - optionally create the cluster OTLP metric server\n\nProceed?" \
-        16 70; then
-      msg_info "Cancelled by user"
-      exit 0
+  REMOVE_OTLP=0
+  if otlp_server_named_exists; then
+    if whiptail --backtitle "Proxmox VE Helper Scripts" \
+        --title "Remove cluster OTLP metric server?" \
+        --defaultno \
+        --yesno "Also delete the cluster-wide OpenTelemetry metric server '${OTLP_SERVER_NAME}'?\n\nThis runs:\n  pvesh delete /cluster/metrics/server/${OTLP_SERVER_NAME}\n\nWARNING: This affects the ENTIRE cluster — every node will stop pushing pvestatd OTLP metrics. Only do this if you're uninstalling Alloy from all nodes." \
+        16 78; then
+      REMOVE_OTLP=1
     fi
   fi
 
+  REMOVE_REPO=0
+  if [ -f "$GRAFANA_SOURCES" ]; then
+    if whiptail --backtitle "Proxmox VE Helper Scripts" \
+        --title "Remove Grafana APT repository?" \
+        --defaultno \
+        --yesno "Also remove the Grafana APT repository (${GRAFANA_SOURCES} and ${GRAFANA_KEYRING})?\n\nSay no if you have other Grafana packages installed (loki, grafana, tempo, ...) that depend on it." \
+        14 78; then
+      REMOVE_REPO=1
+    fi
+  fi
+}
+
+stop_alloy() {
+  if systemctl list-unit-files alloy.service >/dev/null 2>&1; then
+    msg_info "Stopping and disabling alloy.service"
+    systemctl disable --now alloy >/dev/null 2>&1 || true
+    msg_ok "alloy.service stopped"
+  fi
+}
+
+purge_alloy_pkg() {
+  if dpkg -s alloy >/dev/null 2>&1; then
+    msg_info "Purging alloy package"
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y alloy >/dev/null
+    msg_ok "alloy purged"
+  else
+    msg_ok "alloy package not installed — skipping"
+  fi
+}
+
+remove_alloy_config() {
+  if [ -e /etc/alloy ]; then
+    msg_info "Removing /etc/alloy"
+    rm -rf /etc/alloy
+    msg_ok "/etc/alloy removed"
+  fi
+}
+
+remove_otlp_server() {
+  if [ "$REMOVE_OTLP" -ne 1 ]; then
+    return
+  fi
+  if ! otlp_server_named_exists; then
+    msg_ok "Cluster OTLP server '${OTLP_SERVER_NAME}' does not exist — skipping"
+    return
+  fi
+  msg_info "Deleting cluster OTLP metric server '${OTLP_SERVER_NAME}'"
+  pvesh delete /cluster/metrics/server/${OTLP_SERVER_NAME} >/dev/null
+  msg_ok "Cluster OTLP metric server deleted"
+}
+
+remove_grafana_repo() {
+  if [ "$REMOVE_REPO" -ne 1 ]; then
+    return
+  fi
+  msg_info "Removing Grafana APT repository"
+  rm -f "$GRAFANA_SOURCES" "$GRAFANA_KEYRING"
+  apt-get update >/dev/null
+  msg_ok "Grafana APT repository removed"
+}
+
+show_uninstall_summary() {
+  echo
+  echo -e "${BL}╔══════════════════════════════════════════════════════════════╗${CL}"
+  echo -e "${BL}║${CL}             ${GN}Grafana Alloy Uninstallation Complete${CL}            ${BL}║${CL}"
+  echo -e "${BL}╠══════════════════════════════════════════════════════════════╣${CL}"
+  echo -e "${BL}║${CL} ${YW}Hostname:${CL}        $(hostname)"
+  echo -e "${BL}║${CL} ${YW}Package:${CL}         purged"
+  echo -e "${BL}║${CL} ${YW}Config:${CL}          /etc/alloy removed"
+  if [ "$REMOVE_OTLP" -eq 1 ]; then
+    echo -e "${BL}║${CL} ${YW}OTLP server:${CL}     deleted (cluster-wide)"
+  else
+    echo -e "${BL}║${CL} ${YW}OTLP server:${CL}     kept (run pvesh delete /cluster/metrics/server/${OTLP_SERVER_NAME} to remove)"
+  fi
+  if [ "$REMOVE_REPO" -eq 1 ]; then
+    echo -e "${BL}║${CL} ${YW}Grafana APT:${CL}     removed"
+  else
+    echo -e "${BL}║${CL} ${YW}Grafana APT:${CL}     kept"
+  fi
+  echo -e "${BL}╚══════════════════════════════════════════════════════════════╝${CL}"
+  echo
+}
+
+run_install() {
   prompt_inputs
   install_alloy_repo
   install_alloy_pkg
@@ -391,6 +490,71 @@ main() {
   start_alloy
   configure_otlp_server
   show_summary
+}
+
+run_uninstall() {
+  prompt_uninstall_options
+  stop_alloy
+  purge_alloy_pkg
+  remove_alloy_config
+  remove_otlp_server
+  remove_grafana_repo
+  show_uninstall_summary
+}
+
+prompt_action() {
+  # Resolves ACTION in {install, update, uninstall} from env or interactive menu.
+  if [ -n "${ALLOY_ACTION:-}" ]; then
+    case "$ALLOY_ACTION" in
+      install|update|uninstall) ACTION="$ALLOY_ACTION" ;;
+      *) msg_error "Invalid ALLOY_ACTION='$ALLOY_ACTION' (expected install|update|uninstall)"; exit 1 ;;
+    esac
+    msg_ok "Headless action: ${ACTION}"
+    return
+  fi
+
+  if alloy_installed; then
+    # Existing install: offer menu.
+    local choice
+    choice=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
+      --title "Grafana Alloy already installed on $(hostname)" \
+      --menu "Alloy $(dpkg-query -W -f='${Version}' alloy) is installed.\n\nChoose an action:" \
+      18 70 4 \
+      "update"     "Re-run install (upgrade pkg, rewrite config)" \
+      "uninstall"  "Stop alloy, purge pkg, remove /etc/alloy" \
+      "cancel"     "Exit without changes" \
+      3>&1 1>&2 2>&3) || { msg_info "Cancelled by user"; exit 0; }
+    case "$choice" in
+      update)    ACTION="update" ;;
+      uninstall) ACTION="uninstall" ;;
+      cancel|"") msg_info "Cancelled by user"; exit 0 ;;
+    esac
+  else
+    if [ -z "${ALLOY_PROMETHEUS_URL:-}" ] && [ -z "${ALLOY_LOKI_URL:-}" ]; then
+      if ! whiptail --backtitle "Proxmox VE Helper Scripts" \
+          --title "Grafana Alloy on Proxmox VE" \
+          --yesno "Install Grafana Alloy on $(hostname) (PVE ${PVE_VER}).\n\nThis will:\n  - add the Grafana APT repository\n  - install/upgrade the alloy package\n  - write /etc/alloy/config.alloy\n  - enable and start alloy.service\n  - optionally create the cluster OTLP metric server\n\nProceed?" \
+          16 70; then
+        msg_info "Cancelled by user"
+        exit 0
+      fi
+    fi
+    ACTION="install"
+  fi
+}
+
+main() {
+  header_info
+  require_root
+  require_pve
+  require_pve_9
+
+  prompt_action
+
+  case "$ACTION" in
+    install|update) run_install ;;
+    uninstall)      run_uninstall ;;
+  esac
 }
 
 main "$@"
