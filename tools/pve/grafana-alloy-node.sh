@@ -203,7 +203,22 @@ otelcol.receiver.otlp "proxmox" {
 }
 
 otelcol.exporter.prometheus "pve_metrics" {
+  forward_to = [prometheus.relabel.pve_labels.receiver]
+}
+
+prometheus.relabel "pve_labels" {
   forward_to = [prometheus.remote_write.default.receiver]
+
+  rule {
+    action       = "replace"
+    replacement  = constants.hostname
+    target_label = "instance"
+  }
+  rule {
+    action       = "replace"
+    replacement  = "proxmox-pve"
+    target_label = "job"
+  }
 }
 
 // ============================
